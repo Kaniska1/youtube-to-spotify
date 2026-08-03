@@ -1,265 +1,422 @@
-# spotify.py
-import requests
+from __future__ import annotations
+
 import base64
-import re
 import time
+import unicodedata
+from dataclasses import dataclass
+from difflib import SequenceMatcher
+from typing import Any
+from urllib.parse import quote
+
+import requests
+
+
+@dataclass(frozen=True)
+class SpotifyTrack:
+    uri: str
+    name: str
+    artists: str
+    album: str
+    score: float
+
 
 class SpotifyAPI:
-    def __init__(self, client_id, client_secret, refresh_token):
+    API_BASE = "https://api.spotify.com/v1"
+    TOKEN_URL = "https://accounts.spotify.com/api/token"
+
+    def __init__(
+        self,
+        client_id: str,
+        client_secret: str,
+        refresh_token: str,
+    ) -> None:
+        if not all((client_id, client_secret, refresh_token)):
+            raise ValueError(
+                "Spotify client ID, client secret, and refresh token are required."
+            )
+
         self.client_id = client_id
         self.client_secret = client_secret
         self.refresh_token = refresh_token
-        self.token = self.refresh_access_token()
-        self.search_cache = {}
 
-    def refresh_access_token(self):
-        token_url = 'https://accounts.spotify.com/api/token'
-        headers = {
-            'Authorization': 'Basic ' + base64.b64encode(f'{self.client_id}:{self.client_secret}'.encode()).decode(),
-            'Content-Type': 'application/x-www-form-urlencoded'
-        }
-        data = {
-            'grant_type': 'refresh_token',
-            'refresh_token': self.refresh_token
-        }
-        response = requests.post(token_url, headers=headers, data=data)
+        self.session = requests.Session()
+        self.access_token = self.refresh_access_token()
+
+        # Prevent duplicate Spotify searches during one execution.
+        self._search_cache: dict[str, SpotifyTrack | None] = {}
+
+    def refresh_access_token(self) -> str:
+        credentials = f"{self.client_id}:{self.client_secret}".encode("utf-8")
+        encoded_credentials = base64.b64encode(credentials).decode("ascii")
+
+        response = self.session.post(
+            self.TOKEN_URL,
+            headers={
+                "Authorization": f"Basic {encoded_credentials}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": self.refresh_token,
+            },
+            timeout=30,
+        )
+
         if not response.ok:
-            raise RuntimeError(
-                f'Spotify token refresh failed ({response.status_code}): {response.text}'
-            )
-        return response.json()['access_token']
+            detail = response.text
 
-    def fetch_web_api(self, endpoint, method='GET', body=None):
-        url = f'https://api.spotify.com/v1/{endpoint}'
-        headers = {
-            'Authorization': f'Bearer {self.token}',
-            'Content-Type': 'application/json'
-        }
-        retries = 0
-        while True:
-            response = requests.request(method, url, json=body, headers=headers)
-            if response.status_code == 401:
-                print('Refreshing access token...')
-                self.token = self.refresh_access_token()
-                headers['Authorization'] = f'Bearer {self.token}'
-                response = requests.request(method, url, json=body, headers=headers)
-            if response.status_code in {429, 500, 502, 503, 504} and retries < 2:
-                retry_after = None
-                if 'Retry-After' in response.headers:
-                    try:
-                        retry_after = int(response.headers['Retry-After'])
-                    except ValueError:
-                        retry_after = None
-                delay = min(max(retry_after if retry_after is not None else 2, 2), 8)
-                print(f'Spotify transient error ({response.status_code}). Retrying in {delay}s...')
-                time.sleep(delay)
-                retries += 1
+            if response.status_code == 400 and "invalid_grant" in detail:
+                raise RuntimeError(
+                    "Spotify rejected REFRESH_TOKEN. Generate a new refresh token "
+                    "using get_refresh_token.py with the same CLIENT_ID and CLIENT_SECRET."
+                )
+
+            raise RuntimeError(
+                f"Spotify token refresh failed ({response.status_code}): {detail}"
+            )
+
+        payload = response.json()
+        access_token = payload.get("access_token")
+
+        if not access_token:
+            raise RuntimeError(
+                "Spotify token response did not contain an access token."
+            )
+
+        return access_token
+
+    def _request(
+        self,
+        method: str,
+        endpoint: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json: dict[str, Any] | None = None,
+        retries: int = 3,
+    ) -> dict[str, Any] | None:
+        url = f"{self.API_BASE}/{endpoint.lstrip('/')}"
+
+        for attempt in range(retries + 1):
+            response = self.session.request(
+                method,
+                url,
+                params=params,
+                json=json,
+                headers={
+                    "Authorization": f"Bearer {self.access_token}",
+                },
+                timeout=30,
+            )
+
+            if response.status_code == 401 and attempt == 0:
+                self.access_token = self.refresh_access_token()
                 continue
+
             if response.status_code == 429:
-                print('Spotify rate limit exceeded. Skipping this request.')
+                retry_after_raw = response.headers.get("Retry-After", "5")
+
+                try:
+                    retry_after = int(retry_after_raw)
+                except (TypeError, ValueError):
+                    retry_after = 5
+
+                try:
+                    error_body = response.json()
+                except ValueError:
+                    error_body = {"raw": response.text}
+
+                error_data = error_body.get("error", {})
+                reason = error_data.get("reason", "RATE_LIMITED")
+                message = error_data.get("message", "Too many requests")
+
+                print("\nSpotify returned HTTP 429.")
+                print(f"Reason: {reason}")
+                print(f"Message: {message}")
+                print(f"Retry-After: {retry_after} seconds")
+
+                if retry_after > 300:
+                    raise RuntimeError(
+                        "Spotify quota has been exhausted. "
+                        f"Spotify requested a retry after {retry_after} seconds. "
+                        "Stop the program and try again after the quota resets."
+                    )
+
+                if attempt >= retries:
+                    raise RuntimeError(
+                        "Spotify rate limiting continued after all retry attempts."
+                    )
+
+                time.sleep(max(retry_after, 1))
+                continue
+
+            if 500 <= response.status_code < 600:
+                if attempt >= retries:
+                    raise RuntimeError(
+                        f"Spotify server error after {retries + 1} attempts: "
+                        f"{response.status_code} {response.text}"
+                    )
+
+                time.sleep(min(2**attempt, 20))
+                continue
+
+            if not response.ok:
+                raise RuntimeError(
+                    f"Spotify API {method} {endpoint} failed "
+                    f"({response.status_code}): {response.text}"
+                )
+
+            if response.status_code == 204 or not response.content:
                 return None
-            response.raise_for_status()
-            if response.status_code == 200 and not response.content.strip():
-                return None
+
             return response.json()
 
-    def get_playlist_tracks(self, playlist_id):
-        fields = 'items(track(id,uri,name,artists(name),album(release_date),popularity),added_at)'
-        tracks = []
-        offset = 0
-        while True:
-            endpoint = f'playlists/{playlist_id}/tracks?fields={fields}&limit=100&offset={offset}'
-            try:
-                data = self.fetch_web_api(endpoint)
-            except requests.HTTPError as exc:
-                if getattr(exc.response, 'status_code', None) == 403:
-                    print('Warning: unable to read existing playlist tracks. Continuing with add-only sync.')
-                    return []
-                raise
-            items = data.get('items', [])
-            tracks += [
-                {
-                    'id': item['track']['id'],
-                    'uri': item['track']['uri'],
-                    'song_name': item['track']['name'],
-                    'artists': ', '.join(artist.get('name', '') for artist in item['track'].get('artists', []) if artist.get('name')),
-                    'date_added': item['added_at'],
-                    'release_date': item['track'].get('album', {}).get('release_date', ''),
-                    'popularity': item['track'].get('popularity')
-                }
-                for item in items if item.get('track')
-            ]
-            if len(items) < 100:
-                break
-            offset += 100
-        return tracks
+        raise RuntimeError("Spotify request failed after all retries.")
 
-    def _make_track_result(self, track):
-        album = track.get('album') or {}
-        artists = track.get('artists') or []
-        return {
-            'id': track.get('id'),
-            'uri': track.get('uri'),
-            'song_name': track.get('name'),
-            'artists': ', '.join(a.get('name', '') for a in artists if a.get('name')),
-            'album': album.get('name', ''),
-            'release_date': album.get('release_date', ''),
-            'popularity': track.get('popularity'),
-        }
+    @staticmethod
+    def _normalise(value: str) -> str:
+        value = unicodedata.normalize("NFKD", value)
+        value = value.encode("ascii", "ignore").decode("ascii")
+        value = value.lower().replace("&", " and ")
 
-    def search_song(self, query, limit=10):
-        if query in self.search_cache:
-            return self.search_cache[query]
+        noise = (
+            "feat.",
+            "ft.",
+            "featuring",
+            "official music video",
+            "official video",
+            "official audio",
+            "lyric video",
+            "lyrics",
+            "music video",
+            "remastered",
+            "hd",
+            "hq",
+        )
 
-        time.sleep(0.3)
-        endpoint = f'search?q={query}&type=track&limit={limit}'
-        data = self.fetch_web_api(endpoint)
-        if not data:
-            self.search_cache[query] = None
-            return None
-        tracks = data.get('tracks', {}).get('items', [])
-        if not tracks:
-            self.search_cache[query] = None
-            return None
+        for term in noise:
+            value = value.replace(term, " ")
 
-        # Pass 1: full query is a substring of track name or combined artists
-        for track in tracks:
-            track_artists = ', '.join(a['name'] for a in track['artists'])
-            if query.lower() in track['name'].lower() or query.lower() in track_artists.lower():
-                result = self._make_track_result(track)
-                self.search_cache[query] = result
-                return result
+        value = "".join(
+            character if character.isalnum() else " "
+            for character in value
+        )
 
-        stop_words = {'the', 'a', 'an', 'and', 'or', 'by', 'ft', 'feat', 'with', 'of', 'in', 'on'}
-        query_words = {w.lower() for w in query.split() if len(w) > 2 and w.lower() not in stop_words}
+        return " ".join(value.split())
 
-        # Pass 2: artist-name matching
-        for track in tracks:
-            title_words = set(track['name'].lower().split())
-            matched_artists = sum(
-                1 for artist in track['artists']
-                if query_words & {w.lower() for w in re.split(r'\W+', artist['name']) if len(w) > 2}
+    @classmethod
+    def _similarity(cls, expected: str, actual: str) -> float:
+        expected_normalised = cls._normalise(expected)
+        actual_normalised = cls._normalise(actual)
+
+        if not expected_normalised or not actual_normalised:
+            return 0.0
+
+        sequence_score = SequenceMatcher(
+            None,
+            expected_normalised,
+            actual_normalised,
+        ).ratio()
+
+        expected_words = set(expected_normalised.split())
+        actual_words = set(actual_normalised.split())
+
+        union = expected_words | actual_words
+        token_score = (
+            len(expected_words & actual_words) / len(union)
+            if union
+            else 0.0
+        )
+
+        containment_score = 0.92 if (
+            expected_normalised in actual_normalised
+            or actual_normalised in expected_normalised
+        ) else 0.0
+
+        return max(sequence_score, token_score, containment_score)
+
+    def _search_once(
+        self,
+        *,
+        query: str,
+        expected_song: str,
+        expected_artist: str,
+        market: str,
+    ) -> SpotifyTrack | None:
+        data = self._request(
+            "GET",
+            "search",
+            params={
+                "q": query,
+                "type": "track",
+                "limit": 10,
+                "market": market,
+            },
+        ) or {}
+
+        best: SpotifyTrack | None = None
+
+        for item in data.get("tracks", {}).get("items", []):
+            uri = item.get("uri")
+            name = item.get("name", "")
+
+            if not uri or not name:
+                continue
+
+            artists = ", ".join(
+                artist.get("name", "")
+                for artist in item.get("artists", [])
+                if artist.get("name")
             )
-            if matched_artists >= 2:
-                result = self._make_track_result(track)
-                self.search_cache[query] = result
-                return result
-            if matched_artists == 1:
-                if query_words & title_words:
-                    result = self._make_track_result(track)
-                    self.search_cache[query] = result
-                    return result
-                if any(
-                    len(qw) >= 4 and len(tw) >= 4 and (qw in tw or tw in qw)
-                    for qw in query_words for tw in title_words
-                ):
-                    result = self._make_track_result(track)
-                    self.search_cache[query] = result
-                    return result
 
-        # Pass 3: two or more query words appear in the track title
-        for track in tracks:
-            if len(query_words & set(track['name'].lower().split())) >= 2:
-                result = self._make_track_result(track)
-                self.search_cache[query] = result
-                return result
+            title_score = self._similarity(expected_song, name)
+            artist_score = (
+                self._similarity(expected_artist, artists)
+                if expected_artist
+                else 0.65
+            )
 
-        self.search_cache[query] = None
-        return None
+            score = (0.72 * title_score) + (0.28 * artist_score)
 
-    def create_playlist(self, name, public=False):
-        endpoint = 'me/playlists'
-        response = self.fetch_web_api(endpoint, method='POST', body={'name': name, 'public': public})
-        return response
+            candidate = SpotifyTrack(
+                uri=uri,
+                name=name,
+                artists=artists,
+                album=item.get("album", {}).get("name", ""),
+                score=score,
+            )
 
-    def add_tracks_to_playlist(self, playlist_id, track_uris):
-        endpoint = f'playlists/{playlist_id}/tracks'
-        batch_size = 100
-        existing_uris = {track['uri'] for track in self.get_playlist_tracks(playlist_id)}
-        unique_uris = [uri for uri in track_uris if uri not in existing_uris]
-        total = len(unique_uris)
+            if best is None or candidate.score > best.score:
+                best = candidate
 
-        for i in range(0, total, batch_size):
-            batch = unique_uris[i:i + batch_size]
-            try:
-                response = self.fetch_web_api(endpoint, method='POST', body={'uris': batch})
-            except requests.HTTPError as exc:
-                if getattr(exc.response, 'status_code', None) == 403:
-                    print('Warning: playlist add denied by Spotify for this playlist.')
-                    return
-                raise
-            if response.get('snapshot_id'):
-                print(f"Added {len(batch)} tracks - {i + len(batch)}/{total} complete.")
-            else:
-                print(f"Failed to add batch starting at {i}.")
+        return best
 
-        print(f"Finished adding all {total} tracks.")
+    def search_track(
+        self,
+        *,
+        song: str,
+        artist: str = "",
+        fallback_query: str = "",
+        market: str = "IN",
+        minimum_score: float = 0.70,
+    ) -> SpotifyTrack | None:
+        song = song.strip()
+        artist = artist.strip()
+        fallback_query = fallback_query.strip()
+        market = market.strip().upper() or "IN"
 
-    def remove_tracks_from_playlist(self, playlist_id, track_uris):
-        endpoint = f'playlists/{playlist_id}/tracks'
-        batch_size = 100
-        try:
-            for i in range(0, len(track_uris), batch_size):
-                batch = [{'uri': uri} for uri in track_uris[i:i + batch_size]]
-                self.fetch_web_api(endpoint, method='DELETE', body={'tracks': batch})
-                print(f"Removed {len(batch)} tracks from playlist.")
-        except requests.HTTPError as exc:
-            if getattr(exc.response, 'status_code', None) == 403:
-                print('Warning: playlist remove denied by Spotify for this playlist.')
-                return
-            raise
+        cache_key = "|".join(
+            (
+                self._normalise(song),
+                self._normalise(artist),
+                self._normalise(fallback_query),
+                market,
+                f"{minimum_score:.3f}",
+            )
+        )
 
-    def reorder_playlist_tracks(self, playlist_id, track_uris):
-        endpoint = f'playlists/{playlist_id}/tracks'
-        try:
-            body = {'uris': track_uris[:100]}
-            self.fetch_web_api(endpoint, method='PUT', body=body)
+        if cache_key in self._search_cache:
+            return self._search_cache[cache_key]
 
-            current_tracks = self.get_playlist_tracks(playlist_id)
-            if not current_tracks:
-                print('Skipping reorder because existing playlist tracks could not be read.')
-                return
-            current_uris = [t['uri'] for t in current_tracks]
+        queries: list[str] = []
 
-            for i, uri in enumerate(track_uris):
-                current_index = current_uris.index(uri)
-                if current_index != i:
-                    body = {'range_start': current_index, 'insert_before': i}
-                    self.fetch_web_api(f'playlists/{playlist_id}/tracks', method='PUT', body=body)
-                    current_uris.insert(i, current_uris.pop(current_index))
+        if song and artist:
+            queries.append(f'track:"{song}" artist:"{artist}"')
+        elif song:
+            queries.append(song)
+        elif fallback_query:
+            queries.append(fallback_query)
 
-            print(f"Finished reordering {len(track_uris)} tracks.")
-        except requests.HTTPError as exc:
-            if getattr(exc.response, 'status_code', None) == 403:
-                print('Warning: playlist reorder denied by Spotify for this playlist.')
-                return
-            raise
+        broad_query = " ".join(
+            part for part in (song, artist) if part
+        ).strip() or fallback_query
 
-    def reorder_playlist_many_tracks(self, playlist_id, track_uris):
-        try:
-            current_tracks = self.get_playlist_tracks(playlist_id)
-            if not current_tracks:
-                print('Skipping reorder because existing playlist tracks could not be read.')
-                return
-            current_uris = [t['uri'] for t in current_tracks]
+        if (
+            broad_query
+            and all(broad_query.lower() != query.lower() for query in queries)
+        ):
+            queries.append(broad_query)
 
-            uri_set = set(current_uris)
-            final_order = [uri for uri in track_uris if uri in uri_set]
-            current_order = list(current_uris)
+        # Never use more than two Spotify searches for one song.
+        queries = queries[:2]
 
-            for i, uri in enumerate(final_order):
-                current_pos = current_order.index(uri)
-                if current_pos != i:
-                    self.fetch_web_api(
-                        f'playlists/{playlist_id}/tracks',
-                        method='PUT',
-                        body={'range_start': current_pos, 'insert_before': i}
-                    )
-                    current_order.insert(i, current_order.pop(current_pos))
+        best: SpotifyTrack | None = None
 
-            print(f"Finished reordering {len(final_order)} tracks.")
-        except requests.HTTPError as exc:
-            if getattr(exc.response, 'status_code', None) == 403:
-                print('Warning: playlist reorder denied by Spotify for this playlist.')
-                return
-            raise
+        for index, query in enumerate(queries):
+            candidate = self._search_once(
+                query=query,
+                expected_song=song or fallback_query,
+                expected_artist=artist,
+                market=market,
+            )
+
+            if candidate and (
+                best is None or candidate.score > best.score
+            ):
+                best = candidate
+
+            # Strong match: avoid an unnecessary second request.
+            if best and best.score >= 0.90:
+                break
+
+            if index < len(queries) - 1:
+                time.sleep(0.15)
+
+        result = (
+            best
+            if best and best.score >= minimum_score
+            else None
+        )
+
+        self._search_cache[cache_key] = result
+        return result
+
+    def verify_playlist_access(self, playlist_id: str) -> None:
+        playlist_id = playlist_id.strip()
+
+        if not playlist_id:
+            raise ValueError("Spotify playlist ID is required.")
+
+        self._request(
+            "GET",
+            f"playlists/{quote(playlist_id, safe='')}",
+        )
+
+    def replace_playlist_items(
+        self,
+        playlist_id: str,
+        uris: list[str],
+    ) -> None:
+        playlist_id = playlist_id.strip()
+
+        if not playlist_id:
+            raise ValueError("Spotify playlist ID is required.")
+
+        if not uris:
+            raise ValueError(
+                "No Spotify track URIs were supplied. "
+                "The playlist was not modified."
+            )
+
+        endpoint = f"playlists/{quote(playlist_id, safe='')}/items"
+
+        first_batch = uris[:100]
+
+        self._request(
+            "PUT",
+            endpoint,
+            json={"uris": first_batch},
+        )
+
+        print(f"Uploaded {len(first_batch)}/{len(uris)} Spotify tracks...")
+
+        for start in range(100, len(uris), 100):
+            batch = uris[start:start + 100]
+
+            self._request(
+                "POST",
+                endpoint,
+                json={"uris": batch},
+            )
+
+            uploaded = min(start + len(batch), len(uris))
+            print(f"Uploaded {uploaded}/{len(uris)} Spotify tracks...")

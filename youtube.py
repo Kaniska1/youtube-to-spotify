@@ -1,77 +1,117 @@
-# youtube.py
-from googleapiclient.discovery import build
+from __future__ import annotations
+
 import re
+from dataclasses import dataclass
+
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+
+
+@dataclass(frozen=True)
+class YouTubeVideo:
+    title: str
+    video_id: str
+    channel_title: str
+
+    @property
+    def url(self) -> str:
+        return f"https://www.youtube.com/watch?v={self.video_id}"
+
 
 class YouTubeAPI:
-    def __init__(self, api_key):
-        self.api_key = api_key
-        self.youtube = build('youtube', 'v3', developerKey=api_key)
+    def __init__(self, api_key: str) -> None:
+        if not api_key:
+            raise ValueError("YouTube API key is required.")
+        self.youtube = build("youtube", "v3", developerKey=api_key, cache_discovery=False)
 
-    def get_playlist_items(self, playlist_id):
-        request = self.youtube.playlistItems().list(
-            part='snippet',
-            playlistId=playlist_id,
-            maxResults=50
-        )
+    def get_playlist_items(self, playlist_id: str) -> list[YouTubeVideo]:
+        """Return every accessible video in playlist order."""
+        videos: list[YouTubeVideo] = []
+        page_token: str | None = None
 
-        videos = []
-        while request:
-            response = request.execute()
-            for item in response['items']:
-                title = item['snippet']['title']
-                video_id = item['snippet']['resourceId']['videoId']
-                videos.append((title, f"https://www.youtube.com/watch?v={video_id}"))
-            request = self.youtube.playlistItems().list_next(request, response)
+        try:
+            while True:
+                response = self.youtube.playlistItems().list(
+                    part="snippet",
+                    playlistId=playlist_id,
+                    maxResults=50,
+                    pageToken=page_token,
+                ).execute()
+
+                for item in response.get("items", []):
+                    snippet = item.get("snippet", {})
+                    title = (snippet.get("title") or "").strip()
+                    video_id = (
+                        snippet.get("resourceId", {}).get("videoId")
+                        or snippet.get("videoOwnerChannelId")
+                        or ""
+                    )
+                    channel_title = (snippet.get("videoOwnerChannelTitle") or "").strip()
+
+                    if not title or not video_id:
+                        continue
+                    if title.lower() in {"deleted video", "private video"}:
+                        continue
+
+                    videos.append(
+                        YouTubeVideo(
+                            title=title,
+                            video_id=video_id,
+                            channel_title=channel_title,
+                        )
+                    )
+
+                page_token = response.get("nextPageToken")
+                if not page_token:
+                    break
+        except HttpError as exc:
+            raise RuntimeError(f"YouTube API request failed: {exc}") from exc
+
         return videos
 
-    def extract_song_and_artist(self, title):
-        if "-" in title:
-            parts = title.split("-")
-            if len(parts) == 2:
-                artist_first = parts[0].strip()
-                song_first = parts[1].strip()
-                song_second = parts[0].strip()
-                artist_second = parts[1].strip()
-                return (song_first, artist_first), (song_second, artist_second)
 
-        return (title, ""), (title, "")
+_NOISE = re.compile(
+    r"\b(?:official(?:\s+music)?\s+video|official\s+audio|lyrics?|lyric\s+video|"
+    r"visuali[sz]er|audio|music\s+video|video|hd|hq|4k|1080p|remastered?|"
+    r"live(?:\s+performance|\s+session)?|cover|karaoke|sped\s+up|slowed(?:\s+and\s+reverb)?|"
+    r"nightcore|radio\s+edit|extended(?:\s+mix)?|from\s+[^\]\)]+)\b",
+    re.IGNORECASE,
+)
 
-    _NOISE_BRACKET = re.compile(
-        r'^(?:official|music|video|lyrics?|lyric|visualizer|audio|hq|hd|4k|1080p|'
-        r'live|remix|version|edit|clip|cover|feat|ft|featuring|prod|by|mv|ep)\b',
-        re.IGNORECASE
-    )
 
-    def extract_bracket_alternatives(self, text):
-        matches = re.findall(r'[\(\[\{]([^\)\]\}]+)[\)\]\}]', text)
-        results = []
-        for m in matches:
-            m = m.strip()
-            if not m:
-                continue
-            if self._NOISE_BRACKET.match(m):
-                continue
-            substantive = [w for w in m.split() if len(w) > 3 and not self._NOISE_BRACKET.match(w)]
-            if substantive:
-                results.append(m)
-        return results
+def clean_youtube_title(title: str) -> str:
+    """Remove common YouTube decoration while retaining useful remix/version text."""
+    text = title.replace("–", "-").replace("—", "-").replace("｜", "|")
+    text = re.sub(r"https?://\S+", " ", text)
+    text = re.sub(r"#\w+", " ", text)
 
-    def clean_title(self, title):
-        title = re.sub(r'\(.*?\)|\[.*?\]|\{.*?\}|#\S+', '', title)
+    def clean_bracket(match: re.Match[str]) -> str:
+        inner = match.group(1)
+        return " " if _NOISE.search(inner) else f" {inner} "
 
-        unwanted_phrases = [
-            "official music video", "official video", "lyrics", "lyric video", "album",
-            "visualizer", "live", "ft.", "ft", "feat.", "featuring", "prod.", "remix",
-            "version", "audio", "video", "hq", "hd", "4k", "1080p", "lyric", "clip",
-            "performance", "cover", "original", "extended", "edit", "radio edit",
-            "acoustic", "live session", "live performance", "official", "official audio",
-            "official clip", "official hd", "official 4k", "official 1080p"
-        ]
-        for phrase in unwanted_phrases:
-            title = re.sub(fr'(?i)\b{re.escape(phrase)}\b', '', title)
+    text = re.sub(r"[\[(]([^\])]+)[\])]", clean_bracket, text)
+    text = _NOISE.sub(" ", text)
+    text = re.sub(r"\s*\|\s*.*$", " ", text)
+    text = re.sub(r"\s+", " ", text).strip(" -_|:.")
+    return text
 
-        title = re.sub(r"[^\w\s&\-'']", '', title)
-        title = re.sub(r'@\S+', '', title)
-        title = re.sub(r'\s+', ' ', title).strip()
 
-        return title
+def split_artist_title(title: str) -> list[tuple[str, str]]:
+    """Return plausible (artist, song) pairs without pretending the title format is certain."""
+    cleaned = clean_youtube_title(title)
+    candidates: list[tuple[str, str]] = []
+
+    for separator in (" - ", " – ", " — ", ": "):
+        if separator in cleaned:
+            left, right = cleaned.split(separator, 1)
+            left, right = left.strip(), right.strip()
+            if left and right:
+                candidates.extend([(left, right), (right, left)])
+            break
+
+    if not candidates:
+        candidates.append(("", cleaned))
+
+    # Preserve order and remove duplicates.
+    return list(dict.fromkeys(candidates))

@@ -1,128 +1,344 @@
-# script.py
-from spotify import SpotifyAPI
-from youtube import YouTubeAPI
-from dotenv import load_dotenv
+from __future__ import annotations
+
+import csv
+import json
 import os
+import sys
+from dataclasses import dataclass
+from pathlib import Path
 
-def main():
-    load_dotenv()
+from dotenv import load_dotenv
 
-    # Load credentials from .env
-    client_id = os.getenv('CLIENT_ID')
-    client_secret = os.getenv('CLIENT_SECRET')
-    refresh_token = os.getenv('REFRESH_TOKEN')
-    spotify_playlist_id = os.getenv('SPOTIFY_PLAYLIST_ID')
-    api_key = os.getenv('API_KEY')
-    youtube_playlist_id = os.getenv('YOUTUBE_PLAYLIST_ID')
-
-    # Make sure nothing is missing
-    required = {
-        'CLIENT_ID': client_id,
-        'CLIENT_SECRET': client_secret,
-        'REFRESH_TOKEN': refresh_token,
-        'SPOTIFY_PLAYLIST_ID': spotify_playlist_id,
-        'API_KEY': api_key,
-        'YOUTUBE_PLAYLIST_ID': youtube_playlist_id,
-    }
-    missing = [k for k, v in required.items() if not v]
-    if missing:
-        raise EnvironmentError(f"Missing required environment variables: {', '.join(missing)}")
-
-    # Connect to both APIs
-    spotify = SpotifyAPI(client_id, client_secret, refresh_token)
-    youtube = YouTubeAPI(api_key)
-
-    sync_playlist(spotify_playlist_id, youtube_playlist_id, spotify, youtube)
+from spotify import SpotifyAPI, SpotifyTrack
+from youtube import YouTubeAPI, YouTubeVideo, clean_youtube_title, split_artist_title
 
 
-def sync_playlist(spotify_playlist_id, youtube_playlist_id, spotify, youtube, remove=False, reorder=False):
-    print("Fetching YouTube playlist...")
-    target_playlist_id = spotify_playlist_id
-    if spotify_playlist_id:
-        try:
-            spotify.get_playlist_tracks(spotify_playlist_id)
-        except Exception as exc:
-            print(f"Playlist {spotify_playlist_id} is not usable for sync: {exc}")
-            target_playlist_id = None
-    if not target_playlist_id:
-        print("Creating a new Spotify playlist for this sync...")
-        created = spotify.create_playlist('YouTube Sync Backup')
-        target_playlist_id = created['id']
-        print(f"Using new playlist: {target_playlist_id}")
-    youtube_videos = youtube.get_playlist_items(youtube_playlist_id)
-    print(f"Found {len(youtube_videos)} videos on YouTube.\n")
+REPORT_FILE = Path("sync_report.csv")
+CACHE_FILE = Path("resolved_tracks.json")
 
-    found_tracks = []
-    not_found = []
 
-    for i, (title, url) in enumerate(youtube_videos, start=1):
-        # Skip deleted or private videos
-        if any(word in title.lower() for word in ["deleted", "private"]):
-            print(f"{i}. Skipped (Deleted/Private): {title}")
-            continue
+@dataclass
+class MatchResult:
+    video: YouTubeVideo
+    track: SpotifyTrack | None
+    query: str
 
-        # YouTube titles come in two flavours:
-        #   "Artist - Song"  or  "Song - Artist"
-        # We try both and take whichever finds a match first.
-        (song_a, artist_a), (song_b, artist_b) = youtube.extract_song_and_artist(title)
 
-        query_a = f"{youtube.clean_title(song_a)} {youtube.clean_title(artist_a)}".strip()
-        query_b = f"{youtube.clean_title(song_b)} {youtube.clean_title(artist_b)}".strip()
+def require_env(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
 
-        print(f"Searching: {query_a}")
 
-        result = spotify.search_song(query_a) or spotify.search_song(query_b)
+def parse_bool(value: str | None) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
-        # Last resort: try any alternative title hidden in brackets
-        # e.g. "Stayin' Alive (From Saturday Night Fever)" → try "Saturday Night Fever" too
-        if not result:
-            for alt in (youtube.extract_bracket_alternatives(song_a) +
-                        youtube.extract_bracket_alternatives(song_b)):
-                alt_query = f"{youtube.clean_title(alt)} {youtube.clean_title(artist_a)}".strip()
-                result = spotify.search_song(alt_query)
-                if result:
-                    break
+
+def find_spotify_match(
+    spotify: SpotifyAPI,
+    video: YouTubeVideo,
+    market: str,
+    minimum_score: float,
+) -> MatchResult:
+    cleaned = clean_youtube_title(video.title)
+    best: SpotifyTrack | None = None
+    best_query = cleaned
+
+    for artist, song in split_artist_title(video.title):
+        result = spotify.search_track(
+            song=song,
+            artist=artist,
+            fallback_query=cleaned,
+            market=market,
+            minimum_score=minimum_score,
+        )
+
+        if result and (best is None or result.score > best.score):
+            best = result
+            best_query = f"{artist} - {song}" if artist else song
+
+    if best is None and video.channel_title:
+        channel_artist = (
+            video.channel_title
+            .replace("VEVO", "")
+            .replace("Official", "")
+            .strip()
+        )
+
+        result = spotify.search_track(
+            song=cleaned,
+            artist=channel_artist,
+            fallback_query=f"{cleaned} {channel_artist}",
+            market=market,
+            minimum_score=minimum_score,
+        )
 
         if result:
-            found_tracks.append(result['uri'])
-            print(f"{i}. Found: {result['song_name']} by {result['artists']}")
+            best = result
+            best_query = f"{channel_artist} - {cleaned}"
+
+    return MatchResult(video=video, track=best, query=best_query)
+
+
+def write_report(
+    results: list[MatchResult],
+    path: Path = REPORT_FILE,
+) -> None:
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "youtube_title",
+                "youtube_url",
+                "search_query",
+                "status",
+                "spotify_track",
+                "spotify_artist",
+                "spotify_album",
+                "confidence",
+                "spotify_uri",
+            ]
+        )
+
+        for result in results:
+            track = result.track
+            writer.writerow(
+                [
+                    result.video.title,
+                    result.video.url,
+                    result.query,
+                    "matched" if track else "not_found",
+                    track.name if track else "",
+                    track.artists if track else "",
+                    track.album if track else "",
+                    f"{track.score:.3f}" if track else "",
+                    track.uri if track else "",
+                ]
+            )
+
+
+def save_resolved_tracks(
+    results: list[MatchResult],
+    youtube_playlist_id: str,
+    path: Path = CACHE_FILE,
+) -> None:
+    matched_tracks: list[dict[str, object]] = []
+
+    for result in results:
+        if result.track is None:
+            continue
+
+        matched_tracks.append(
+            {
+                "youtube_title": result.video.title,
+                "youtube_url": result.video.url,
+                "search_query": result.query,
+                "spotify_uri": result.track.uri,
+                "spotify_track": result.track.name,
+                "spotify_artists": result.track.artists,
+                "spotify_album": result.track.album,
+                "confidence": round(result.track.score, 4),
+            }
+        )
+
+    payload = {
+        "youtube_playlist_id": youtube_playlist_id,
+        "matched_count": len(matched_tracks),
+        "tracks": matched_tracks,
+    }
+
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+
+    print(f"  Cache: {path}")
+
+
+def load_resolved_uris(
+    expected_youtube_playlist_id: str,
+    path: Path = CACHE_FILE,
+) -> list[str]:
+    if not path.exists():
+        raise RuntimeError(
+            f"{path} was not found. Run once with DRY_RUN=true first."
+        )
+
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{path} contains invalid JSON.") from exc
+
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"{path} has an invalid structure.")
+
+    cached_playlist_id = str(payload.get("youtube_playlist_id", "")).strip()
+
+    if cached_playlist_id and cached_playlist_id != expected_youtube_playlist_id:
+        raise RuntimeError(
+            "The cache belongs to a different YouTube playlist. "
+            "Delete resolved_tracks.json and run again with DRY_RUN=true."
+        )
+
+    tracks = payload.get("tracks")
+    if not isinstance(tracks, list):
+        raise RuntimeError(f"{path} does not contain a valid tracks list.")
+
+    uris: list[str] = []
+
+    for item in tracks:
+        if not isinstance(item, dict):
+            continue
+
+        uri = str(item.get("spotify_uri", "")).strip()
+        if uri:
+            uris.append(uri)
+
+    if not uris:
+        raise RuntimeError(f"{path} contains no Spotify track URIs.")
+
+    return uris
+
+
+def resolve_and_cache_tracks(
+    spotify: SpotifyAPI,
+    youtube: YouTubeAPI,
+    youtube_playlist_id: str,
+    market: str,
+    minimum_score: float,
+) -> int:
+    print("Fetching the YouTube playlist...")
+    videos = youtube.get_playlist_items(youtube_playlist_id)
+
+    if not videos:
+        raise RuntimeError(
+            "No accessible videos were found in the YouTube playlist."
+        )
+
+    print(f"Found {len(videos)} accessible YouTube videos.\n")
+
+    results: list[MatchResult] = []
+
+    for index, video in enumerate(videos, start=1):
+        result = find_spotify_match(
+            spotify=spotify,
+            video=video,
+            market=market,
+            minimum_score=minimum_score,
+        )
+        results.append(result)
+
+        if result.track:
+            print(
+                f"[{index}/{len(videos)}] MATCH {result.track.score:.2f}: "
+                f"{video.title} -> "
+                f"{result.track.name} — {result.track.artists}"
+            )
         else:
-            not_found.append(title)
-            print(f"{i}. Not found: {title}")
+            print(f"[{index}/{len(videos)}] NOT FOUND: {video.title}")
 
-    # --- Add new tracks ---
-    spotify_tracks = spotify.get_playlist_tracks(target_playlist_id)
-    spotify_uris = [t['uri'] for t in spotify_tracks]
+    write_report(results)
+    save_resolved_tracks(
+        results=results,
+        youtube_playlist_id=youtube_playlist_id,
+    )
 
-    to_add = [uri for uri in found_tracks if uri not in spotify_uris]
-    if to_add:
-        print(f"\nAdding {len(to_add)} new tracks...")
-        spotify.add_tracks_to_playlist(target_playlist_id, to_add)
+    matched = sum(1 for result in results if result.track is not None)
+    unmatched = len(videos) - matched
 
-    # --- Remove tracks that are no longer in the YouTube playlist ---
-    if remove:
-        to_remove = [uri for uri in spotify_uris if uri not in found_tracks]
-        if to_remove:
-            print(f"Removing {len(to_remove)} tracks...")
-            spotify.remove_tracks_from_playlist(target_playlist_id, to_remove)
+    print("\nMatch summary")
+    print(f"  YouTube videos: {len(videos)}")
+    print(f"  Spotify matches: {matched}")
+    print(f"  Not matched: {unmatched}")
+    print(f"  Report: {REPORT_FILE}")
 
-    # --- Reorder Spotify playlist to match YouTube order ---
-    if reorder:
-        print("\nReordering playlist to match YouTube order...")
-        if len(youtube_videos) > 100:
-            spotify.reorder_playlist_many_tracks(target_playlist_id, found_tracks)
-        else:
-            spotify.reorder_playlist_tracks(target_playlist_id, found_tracks)
+    if matched == 0:
+        raise RuntimeError(
+            "No tracks matched; Spotify playlist was left unchanged."
+        )
 
-    # --- Summary ---
-    print("\n--- Done ---")
-    print(f"YouTube videos:     {len(youtube_videos)}")
-    print(f"Found on Spotify:   {len(found_tracks)}")
-    print(f"Not found:          {len(not_found)}")
-    print(f"Added:              {len(to_add)}")
-    if remove:
-        print(f"Removed:            {len(to_remove)}")
+    print("\nDRY_RUN=true, so the Spotify playlist was not modified.")
+    print(
+        "The successful matches were saved to resolved_tracks.json. "
+        "Set DRY_RUN=false to reuse them without searching Spotify again."
+    )
+
+    return 0
 
 
-if __name__ == '__main__':
-    main()
+def sync_cached_tracks(
+    spotify: SpotifyAPI,
+    spotify_playlist_id: str,
+    youtube_playlist_id: str,
+) -> int:
+    print("Loading previously resolved Spotify tracks...")
+    matched_uris = load_resolved_uris(youtube_playlist_id)
+
+    print(f"Loaded {len(matched_uris)} cached Spotify tracks.")
+    print("No Spotify search requests will be made.")
+    print(
+        "Replacing the Spotify playlist with the cached tracks "
+        "in YouTube order..."
+    )
+
+    spotify.replace_playlist_items(
+        spotify_playlist_id,
+        matched_uris,
+    )
+
+    print(
+        f"Done. Spotify playlist now contains "
+        f"{len(matched_uris)} matched tracks in order."
+    )
+
+    return 0
+
+
+def main() -> int:
+    load_dotenv()
+
+    client_id = require_env("CLIENT_ID")
+    client_secret = require_env("CLIENT_SECRET")
+    refresh_token = require_env("REFRESH_TOKEN")
+    spotify_playlist_id = require_env("SPOTIFY_PLAYLIST_ID")
+    youtube_api_key = require_env("API_KEY")
+    youtube_playlist_id = require_env("YOUTUBE_PLAYLIST_ID")
+
+    market = os.getenv("SPOTIFY_MARKET", "IN").strip() or "IN"
+    minimum_score = float(os.getenv("MINIMUM_MATCH_SCORE", "0.70"))
+    dry_run = parse_bool(os.getenv("DRY_RUN", "false"))
+
+    spotify = SpotifyAPI(
+        client_id,
+        client_secret,
+        refresh_token,
+    )
+
+    spotify.verify_playlist_access(spotify_playlist_id)
+
+    if dry_run:
+        youtube = YouTubeAPI(youtube_api_key)
+        return resolve_and_cache_tracks(
+            spotify=spotify,
+            youtube=youtube,
+            youtube_playlist_id=youtube_playlist_id,
+            market=market,
+            minimum_score=minimum_score,
+        )
+
+    return sync_cached_tracks(
+        spotify=spotify,
+        spotify_playlist_id=spotify_playlist_id,
+        youtube_playlist_id=youtube_playlist_id,
+    )
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("\nOperation cancelled.", file=sys.stderr)
+        raise SystemExit(130)
+    except (RuntimeError, ValueError) as exc:
+        print(f"\nERROR: {exc}", file=sys.stderr)
+        raise SystemExit(1)
